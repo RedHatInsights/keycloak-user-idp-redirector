@@ -4,10 +4,10 @@ import org.jboss.logging.Logger;
 import org.keycloak.authentication.AuthenticationFlowContext;
 import org.keycloak.authentication.Authenticator;
 import org.keycloak.models.FederatedIdentityModel;
+import org.keycloak.models.IdentityProviderModel;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserModel;
-import org.keycloak.services.managers.AuthenticationManager;
 
 import jakarta.ws.rs.core.Response;
 import java.util.Optional;
@@ -38,19 +38,31 @@ public class UserIdpRedirectAuthenticator implements Authenticator {
 
         if (identity.isPresent()) {
             String idpAlias = identity.get().getIdentityProvider();
+
+            // Validate IDP exists and is enabled before redirect
+            IdentityProviderModel idpModel = realm.getIdentityProviderByAlias(idpAlias);
+            if (idpModel == null || !idpModel.isEnabled()) {
+                log.warnf("User %s linked to invalid/disabled IDP: %s", user.getUsername(), idpAlias);
+                context.attempted();
+                return;
+            }
+
             log.infof("Redirecting user %s to linked IDP: %s", user.getUsername(), idpAlias);
 
-            // Redirect to IDP
-            String redirectUrl = context.getActionUrl(context.generateAccessCode()).toString();
+            // Build broker redirect URL using Keycloak's URI builder (prevents injection)
+            String brokerUrl = context.getUriInfo().getBaseUriBuilder()
+                .path("realms")
+                .path(realm.getName())
+                .path("broker")
+                .path(idpAlias)
+                .path("login")
+                .queryParam("client_id", context.getAuthenticationSession().getClient().getClientId())
+                .queryParam("tab_id", context.getAuthenticationSession().getTabId())
+                .build()
+                .toString();
+
             Response response = Response.status(302)
-                .location(java.net.URI.create(
-                    context.getUriInfo().getBaseUri() +
-                    "realms/" + realm.getName() +
-                    "/broker/" + idpAlias + "/login?" +
-                    "client_id=" + context.getAuthenticationSession().getClient().getClientId() +
-                    "&tab_id=" + context.getAuthenticationSession().getTabId() +
-                    "&session_code=" + context.getAuthenticationSession().getParentSession().getId()
-                ))
+                .location(java.net.URI.create(brokerUrl))
                 .build();
 
             context.forceChallenge(response);

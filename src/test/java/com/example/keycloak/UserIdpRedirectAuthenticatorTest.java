@@ -11,11 +11,13 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.core.UriBuilder;
 import jakarta.ws.rs.core.UriInfo;
 import java.net.URI;
 import java.util.stream.Stream;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.*;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.withSettings;
@@ -65,17 +67,22 @@ class UserIdpRedirectAuthenticatorTest {
 
     private void setupFullMocks() {
         setupBasicMocks();
-        when(context.getAuthenticationSession()).thenReturn(authSession);
-        when(authSession.getClient()).thenReturn(client);
-        when(authSession.getParentSession()).thenReturn(rootAuthSession);
-        when(authSession.getTabId()).thenReturn("test-tab-id");
-        when(client.getClientId()).thenReturn("test-client");
-        when(rootAuthSession.getId()).thenReturn("test-session-id");
-        when(realm.getName()).thenReturn("test-realm");
-        when(context.getUriInfo()).thenReturn(uriInfo);
-        when(uriInfo.getBaseUri()).thenReturn(URI.create("http://localhost:8080/"));
-        when(context.getActionUrl(any())).thenReturn(URI.create("http://localhost:8080/action"));
-        when(context.generateAccessCode()).thenReturn("test-code");
+        lenient().when(context.getAuthenticationSession()).thenReturn(authSession);
+        lenient().when(authSession.getClient()).thenReturn(client);
+        lenient().when(authSession.getParentSession()).thenReturn(rootAuthSession);
+        lenient().when(authSession.getTabId()).thenReturn("test-tab-id");
+        lenient().when(client.getClientId()).thenReturn("test-client");
+        lenient().when(rootAuthSession.getId()).thenReturn("test-session-id");
+        lenient().when(realm.getName()).thenReturn("test-realm");
+        lenient().when(context.getUriInfo()).thenReturn(uriInfo);
+        lenient().when(uriInfo.getBaseUri()).thenReturn(URI.create("http://localhost:8080/"));
+        lenient().when(context.getActionUrl(any())).thenReturn(URI.create("http://localhost:8080/action"));
+        lenient().when(context.generateAccessCode()).thenReturn("test-code");
+
+        // Mock UriBuilder for secure URL construction
+        UriBuilder uriBuilder = mock(UriBuilder.class, RETURNS_SELF);
+        lenient().when(uriInfo.getBaseUriBuilder()).thenReturn(uriBuilder);
+        lenient().when(uriBuilder.build()).thenReturn(URI.create("http://localhost:8080/realms/test-realm/broker/github/login?client_id=test-client&tab_id=test-tab-id"));
     }
 
     @Test
@@ -116,6 +123,10 @@ class UserIdpRedirectAuthenticatorTest {
         FederatedIdentityModel identity = mock(FederatedIdentityModel.class);
         when(identity.getIdentityProvider()).thenReturn("github");
 
+        IdentityProviderModel idpModel = mock(IdentityProviderModel.class);
+        when(idpModel.isEnabled()).thenReturn(true);
+        when(realm.getIdentityProviderByAlias("github")).thenReturn(idpModel);
+
         when(userProvider.getFederatedIdentitiesStream(realm, user))
             .thenReturn(Stream.of(identity));
 
@@ -140,6 +151,11 @@ class UserIdpRedirectAuthenticatorTest {
         FederatedIdentityModel identity2 = mock(FederatedIdentityModel.class, withSettings().lenient());
         lenient().when(identity2.getIdentityProvider()).thenReturn("google");
 
+        IdentityProviderModel idpModel = mock(IdentityProviderModel.class);
+        lenient().when(idpModel.isEnabled()).thenReturn(true);
+        lenient().when(realm.getIdentityProviderByAlias("github")).thenReturn(idpModel);
+        lenient().when(realm.getIdentityProviderByAlias("google")).thenReturn(idpModel);
+
         when(userProvider.getFederatedIdentitiesStream(realm, user))
             .thenReturn(Stream.of(identity1, identity2));
 
@@ -150,6 +166,52 @@ class UserIdpRedirectAuthenticatorTest {
         // Should redirect to one of them (first in iteration order)
         verify(context).forceChallenge(any(Response.class));
         verify(context, never()).attempted();
+    }
+
+    @Test
+    void testAuthenticateWithDisabledIdp() {
+        // Given
+        setupFullMocks();
+        when(context.getUser()).thenReturn(user);
+
+        FederatedIdentityModel identity = mock(FederatedIdentityModel.class);
+        when(identity.getIdentityProvider()).thenReturn("github");
+
+        IdentityProviderModel idpModel = mock(IdentityProviderModel.class);
+        when(idpModel.isEnabled()).thenReturn(false);
+        when(realm.getIdentityProviderByAlias("github")).thenReturn(idpModel);
+
+        when(userProvider.getFederatedIdentitiesStream(realm, user))
+            .thenReturn(Stream.of(identity));
+
+        // When
+        authenticator.authenticate(context);
+
+        // Then
+        verify(context).attempted();
+        verify(context, never()).forceChallenge(any());
+    }
+
+    @Test
+    void testAuthenticateWithNonexistentIdp() {
+        // Given
+        setupFullMocks();
+        when(context.getUser()).thenReturn(user);
+
+        FederatedIdentityModel identity = mock(FederatedIdentityModel.class);
+        when(identity.getIdentityProvider()).thenReturn("deleted-idp");
+
+        when(realm.getIdentityProviderByAlias("deleted-idp")).thenReturn(null);
+
+        when(userProvider.getFederatedIdentitiesStream(realm, user))
+            .thenReturn(Stream.of(identity));
+
+        // When
+        authenticator.authenticate(context);
+
+        // Then
+        verify(context).attempted();
+        verify(context, never()).forceChallenge(any());
     }
 
     @Test
