@@ -105,7 +105,7 @@ public class UserIdpRedirectAuthenticator implements Authenticator {
             Response form = context.form()
                 .setError("invalidIdpSelection")
                 .createForm("select-idp.ftl");
-        context.forceChallenge(form);
+            context.challenge(form);
             return;
         }
 
