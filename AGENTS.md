@@ -1,181 +1,63 @@
 # Keycloak User IDP Redirector Plugin
 
-## Overview
-Keycloak 26 authenticator plugin that auto-redirects users to their linked federated IDP after username entry. Skips password prompt when user has federation link.
+Keycloak 26 authenticator plugin that owns the username-only login form and auto-redirects users to their linked federated IDP. Checks federation links before Home IDP Discovery does domain matching, while preserving the standard login UX.
 
 ## Architecture
 
 ### Plugin Components
-- `UserIdpRedirectAuthenticator` - checks user's federated identities, redirects to IDP if found
-- `UserIdpRedirectAuthenticatorFactory` - SPI registration, display metadata
+- `UserIdpRedirectAuthenticator` — renders username form, checks federation links, redirects to IDP
+- `UserIdpRedirectAuthenticatorFactory` — SPI registration, display metadata
 
 ### Execution Context
-- **Requires user object** - `requiresUser() = true` means this runs AFTER username resolution
-- **Position in flow** - must come AFTER "Username Password Form" or equivalent
-- **Not standalone** - depends on prior step identifying user
+- **Renders a username-only form** — uses `context.form().createLoginUsername()` (Keycloak's built-in template) when no username hint exists
+- **Supports bypass** — when `ATTEMPTED_USERNAME` auth note or `login_hint` client note is already set (e.g. from OIDC client), skips the form and checks federation directly
+- **Does not require a pre-resolved user** — `requiresUser() = false`. Resolves the `UserModel` itself via `session.users().getUserByUsername()`
+- **Sets `ATTEMPTED_USERNAME`** — on form submission, stores the username as an auth note so downstream authenticators (Home IDP Discovery, password form) can read it
+- **Handles two form submissions** — `action()` dispatches between username submission (`username` param) and IDP selection (`idpAlias` param for multi-IDP users)
 
-### Integration Points
+### Flow Logic
+1. `authenticate()` checks for existing username hint (`ATTEMPTED_USERNAME` or `login_hint`)
+   - **Hint found** → resolve user, check federation, redirect or `attempted()`
+   - **No hint** → render username-only form via `challenge()`
+2. `action()` receives form submission
+   - **Username submitted** → resolve user, check federation links
+     - Federation found (single IDP) → redirect
+     - Federation found (multiple IDPs) → show selection form
+     - No federation or unknown user → `attempted()` with `ATTEMPTED_USERNAME` set
+   - **IDP alias submitted** → validate against session allowlist, redirect
 
-#### Home IDP Discovery Plugin
-**CRITICAL:** This plugin MUST run BEFORE Home IDP Discovery to avoid routing conflicts.
+## Integration: Home IDP Discovery
 
-**Recommended execution order:**
-```
-1. Username entry (user identified)
-2. THIS PLUGIN (user → linked IDP) - checks federation links first
-3. Home IDP Discovery (domain → IDP mapping) - fallback for domain patterns
-4. Password/OTP (final fallback)
-```
+Home IDP Discovery (`de.sventorben:keycloak-home-idp-discovery`) is a **third-party** authenticator. It reads the `ATTEMPTED_USERNAME` auth note (set by this plugin) and does domain-based matching. It never calls `context.setUser()` on no-match.
 
-**Why this order matters:**
-- User `bob@example.com` has federation link to IDP-B
-- Domain pattern `@example.com` maps to IDP-A via Home IDP Discovery
-- **Wrong order:** Home IDP Discovery catches `@example.com` first → sends bob to IDP-A (incorrect)
-- **Right order:** This plugin catches bob's federation link first → sends to IDP-B (correct)
+**CRITICAL:** This plugin MUST run BEFORE Home IDP Discovery. It owns the username form and sets `ATTEMPTED_USERNAME` for downstream consumers.
 
 **Priority hierarchy:** User-specific federation link > Domain pattern > Password
 
-#### Browser Flow Configuration
-**RECOMMENDED:**
+**Recommended flow:**
 ```
 Browser Flow
 ├─ Cookie (ALTERNATIVE)
-├─ Browser Forms (ALTERNATIVE)
-│  ├─ Username Form (REQUIRED)
-│  ├─ User IDP Redirector (REQUIRED)     ← THIS PLUGIN - run first
-│  ├─ Home IDP Discovery (REQUIRED)      ← fallback for domain patterns
-│  └─ Password Form (REQUIRED)           ← final fallback
-└─ OTP (CONDITIONAL)
-```
-
-**INCORRECT (causes routing conflicts):**
-```
-Browser Flow
-├─ Cookie (ALTERNATIVE)
-├─ Browser Forms (ALTERNATIVE)
-│  ├─ Username Form (REQUIRED)
-│  ├─ Home IDP Discovery (REQUIRED)      ← catches domain first (wrong!)
-│  ├─ User IDP Redirector (REQUIRED)     ← never runs if domain matched
-│  └─ Password Form (REQUIRED)
-└─ OTP (CONDITIONAL)
+├─ User IDP Redirector (ALTERNATIVE)   ← username form, federation check
+├─ Home IDP Discovery (ALTERNATIVE)    ← bypassLoginPage=true, domain match
+├─ Forms Subflow (ALTERNATIVE)
+│  └─ Username+Password Form (REQUIRED) ← full form, username pre-filled
 ```
 
 ## Build
-
-### Requirements
-- Java 17+
-- Maven 3.6+
-- Keycloak 26.x dependencies (provided scope)
-
-### Commands
 ```bash
 mvn clean package          # build
-mvn clean test            # unit tests
-mvn clean verify          # unit + integration tests
+mvn clean test             # unit tests
+mvn clean verify           # unit + integration tests
 ```
 
 Output: `target/user-idp-redirector-1.0.0.jar`
 
-## Deploy
+## Reference
 
-### Local Development (podman)
-```bash
-make run-dev
-# or
-podman run -d \
-  -v $(pwd)/target/user-idp-redirector-1.0.0.jar:/opt/keycloak/providers/user-idp-redirector-1.0.0.jar:z \
-  -p 8080:8080 \
-  -e KEYCLOAK_ADMIN=admin \
-  -e KEYCLOAK_ADMIN_PASSWORD=admin \
-  quay.io/keycloak/keycloak:26.0.0 \
-  start-dev
-```
-
-### Production
-```bash
-cp target/user-idp-redirector-1.0.0.jar /opt/keycloak/providers/
-/opt/keycloak/bin/kc.sh build
-/opt/keycloak/bin/kc.sh start
-```
-
-## Configuration
-
-### Enable in Realm
-1. Authentication → Flows
-2. Copy "Browser" flow
-3. Add "User IDP Redirector" step AFTER username/password form
-4. Set to REQUIRED
-5. Realm Settings → Browser Flow → select modified flow
-
-### Testing Configuration
-Create test users:
-- User with single IDP link → should redirect
-- User with multiple IDP links → redirects to first
-- User with no IDP links → continues to password
-
-## Testing
-
-### Unit Tests
-Mock Keycloak context, verify redirect logic:
-- User with federation → 302 redirect to IDP
-- User without federation → `attempted()` call
-- No user object → `attempted()` call
-
-### Integration Tests
-Real Keycloak instance via Testcontainers:
-- End-to-end flow with federated user
-- Verify no interference with Home IDP Discovery
-- Edge case: user with domain match + different federation
-
-Run: `make test` or `make test-integration`
-
-## Edge Cases
-
-### Multiple Federations
-Takes first from `identities.iterator().next()` - non-deterministic if >1 link. Consider:
-- Config option to select by priority
-- UI to set preferred IDP
-- Redirect to account linking page
-
-### Stale Federation Links
-Plugin doesn't validate IDP still exists/enabled. If IDP deleted, redirect fails. Consider:
-- Catch redirect errors
-- Validate IDP enabled before redirect
-- Log failures
-
-### Mixed Auth Flows
-If user linked to external IDP but tries direct auth, this forces IDP redirect. May frustrate users wanting local password. Consider:
-- Query param to skip redirector
-- Remember last auth method
-- Allow ALTERNATIVE instead of REQUIRED
-
-## Troubleshooting
-
-### User Not Redirecting
-- Check user has federation: Admin Console → Users → <user> → Federated Identity
-- Verify flow order: redirector AFTER username form
-- Check logs: look for "User IDP Redirector" execution
-
-### Redirect Loop
-- Home IDP Discovery + this plugin both redirecting
-- Check both targeting same IDP or different
-- Verify Home IDP Discovery doesn't pre-redirect
-
-### 404 on Redirect
-- IDP alias mismatch
-- IDP disabled/deleted
-- Check URL construction at line 38-46 of authenticator
-
-## Development
-
-### Adding Configuration
-Currently no config options. To add:
-1. Set `isConfigurable() = true` in factory
-2. Add `ProviderConfigProperty` entries
-3. Read config in `authenticate()` via `context.getAuthenticatorConfig()`
-
-### Supporting Multiple IDPs
-Replace `identities.iterator().next()` with:
-- Priority lookup from user attributes
-- Config-defined preference order
-- UI selection if >1 available
+- `.claude/agents/deploy.md` — local dev (podman) and production deployment
+- `.claude/agents/configuration.md` — realm setup and test user creation
+- `.claude/agents/testing.md` — unit and integration test strategy
+- `.claude/agents/edge-cases.md` — multiple federations, stale links, mixed auth flows
+- `.claude/agents/troubleshooting.md` — debugging redirect failures, loops, 404s
+- `.claude/agents/development.md` — adding config options, supporting multiple IDPs
