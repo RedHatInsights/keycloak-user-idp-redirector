@@ -7,6 +7,7 @@ import org.keycloak.authentication.Authenticator;
 import org.keycloak.authentication.authenticators.browser.AbstractUsernameFormAuthenticator;
 import org.keycloak.events.Details;
 import org.keycloak.forms.login.LoginFormsProvider;
+import org.keycloak.models.Constants;
 import org.keycloak.models.FederatedIdentityModel;
 import org.keycloak.models.IdentityProviderModel;
 import org.keycloak.models.KeycloakSession;
@@ -22,6 +23,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -29,6 +31,9 @@ public class UserIdpRedirectAuthenticator implements Authenticator {
 
     private static final Logger log = Logger.getLogger(UserIdpRedirectAuthenticator.class);
     private static final String SESSION_NOTE_ALIASES = "idp_redirector_aliases";
+    private static final String DOMAINS_KEY = "home.idp.discovery.domains";
+    private static final String SUBDOMAINS_KEY = "home.idp.discovery.matchSubdomains";
+    private static final String USER_ATTRIBUTE = "email";
     static final String ATTEMPTED_USERNAME = AbstractUsernameFormAuthenticator.ATTEMPTED_USERNAME;
 
     @Override
@@ -70,7 +75,12 @@ public class UserIdpRedirectAuthenticator implements Authenticator {
         UserModel user = context.getSession().users().getUserByUsername(realm, username);
 
         if (user == null) {
-            log.debugf("Unknown user '%s', passing through", username);
+            log.debugf("Unknown user '%s', checking domain match", username);
+            Optional<IdentityProviderModel> domainIdp = getIdpByDomainMatchFromUsername(realm, username);
+            if (domainIdp.isPresent()) {
+                redirectToIdpWithoutUser(context, realm, domainIdp.get().getAlias(), username);
+                return;
+            }
             context.attempted();
             return;
         }
@@ -80,6 +90,13 @@ public class UserIdpRedirectAuthenticator implements Authenticator {
         List<IdentityProviderModel> validIdps = getEnabledFederatedIdps(context, realm, user);
 
         if (validIdps.isEmpty()) {
+            Optional<IdentityProviderModel> domainIdp = getIdpByDomainMatch(realm, user);
+            if (domainIdp.isPresent()) {
+                log.debugf("No federation link, redirecting user '%s' via domain match to IDP: %s",
+                    username, domainIdp.get().getAlias());
+                redirectToIdp(context, realm, domainIdp.get().getAlias(), user);
+                return;
+            }
             context.attempted();
             return;
         }
@@ -107,6 +124,12 @@ public class UserIdpRedirectAuthenticator implements Authenticator {
         UserModel user = context.getSession().users().getUserByUsername(realm, username);
 
         if (user == null) {
+            Optional<IdentityProviderModel> domainIdp = getIdpByDomainMatchFromUsername(realm, username);
+            if (domainIdp.isPresent()) {
+                context.getAuthenticationSession().setAuthNote(ATTEMPTED_USERNAME, username);
+                redirectToIdpWithoutUser(context, realm, domainIdp.get().getAlias(), username);
+                return;
+            }
             context.getAuthenticationSession().setAuthNote(ATTEMPTED_USERNAME, username);
             context.attempted();
             return;
@@ -117,6 +140,14 @@ public class UserIdpRedirectAuthenticator implements Authenticator {
         List<IdentityProviderModel> validIdps = getEnabledFederatedIdps(context, realm, user);
 
         if (validIdps.isEmpty()) {
+            Optional<IdentityProviderModel> domainIdp = getIdpByDomainMatch(realm, user);
+            if (domainIdp.isPresent()) {
+                log.debugf("No federation link, redirecting user '%s' via domain match to IDP: %s",
+                    username, domainIdp.get().getAlias());
+                context.getAuthenticationSession().setAuthNote(ATTEMPTED_USERNAME, username);
+                redirectToIdp(context, realm, domainIdp.get().getAlias(), user);
+                return;
+            }
             context.getAuthenticationSession().setAuthNote(ATTEMPTED_USERNAME, username);
             context.attempted();
             return;
@@ -212,6 +243,47 @@ public class UserIdpRedirectAuthenticator implements Authenticator {
         return idpList;
     }
 
+    Optional<IdentityProviderModel> getIdpByDomainMatch(RealmModel realm, UserModel user) {
+        String email = user.getFirstAttribute(USER_ATTRIBUTE);
+        return extractDomain(email).flatMap(domain -> findIdpForDomain(realm, domain));
+    }
+
+    Optional<IdentityProviderModel> getIdpByDomainMatchFromUsername(RealmModel realm, String username) {
+        return extractDomain(username).flatMap(domain -> findIdpForDomain(realm, domain));
+    }
+
+    private Optional<String> extractDomain(String emailOrUsername) {
+        if (emailOrUsername == null) return Optional.empty();
+        int atIndex = emailOrUsername.trim().lastIndexOf('@');
+        if (atIndex < 0) return Optional.empty();
+        String domain = emailOrUsername.trim().substring(atIndex + 1).toLowerCase();
+        return domain.isEmpty() ? Optional.empty() : Optional.of(domain);
+    }
+
+    private Optional<IdentityProviderModel> findIdpForDomain(RealmModel realm, String userDomain) {
+        return realm.getIdentityProvidersStream()
+            .filter(IdentityProviderModel::isEnabled)
+            .filter(idp -> idpSupportsDomain(idp, userDomain))
+            .findFirst();
+    }
+
+    private boolean idpSupportsDomain(IdentityProviderModel idp, String userDomain) {
+        Map<String, String> config = idp.getConfig();
+        String domainsKey = config.containsKey(DOMAINS_KEY + "." + USER_ATTRIBUTE)
+            ? DOMAINS_KEY + "." + USER_ATTRIBUTE : DOMAINS_KEY;
+        String domainsValue = config.getOrDefault(domainsKey, "");
+
+        String subdomainsKey = config.containsKey(SUBDOMAINS_KEY + "." + USER_ATTRIBUTE)
+            ? SUBDOMAINS_KEY + "." + USER_ATTRIBUTE : SUBDOMAINS_KEY;
+        boolean matchSubdomains = Boolean.parseBoolean(config.getOrDefault(subdomainsKey, "false"));
+
+        return Arrays.stream(Constants.CFG_DELIMITER_PATTERN.split(domainsValue))
+            .map(String::toLowerCase)
+            .anyMatch(configuredDomain ->
+                configuredDomain.equalsIgnoreCase(userDomain) ||
+                (matchSubdomains && userDomain.endsWith("." + configuredDomain)));
+    }
+
     private static String trimToNull(String value) {
         if (value == null) {
             return null;
@@ -220,9 +292,17 @@ public class UserIdpRedirectAuthenticator implements Authenticator {
         return value.isEmpty() ? null : value;
     }
 
-    private void redirectToIdp(AuthenticationFlowContext context, RealmModel realm, String idpAlias, UserModel user) {
-        log.infof("Redirecting user %s to linked IDP: %s", user.getUsername(), idpAlias);
+    private void redirectToIdpWithoutUser(AuthenticationFlowContext context, RealmModel realm, String idpAlias, String username) {
+        log.infof("Redirecting unknown user '%s' to IDP via domain match: %s", username, idpAlias);
+        sendIdpRedirect(context, realm, idpAlias);
+    }
 
+    private void redirectToIdp(AuthenticationFlowContext context, RealmModel realm, String idpAlias, UserModel user) {
+        log.infof("Redirecting user %s to IDP: %s", user.getUsername(), idpAlias);
+        sendIdpRedirect(context, realm, idpAlias);
+    }
+
+    private void sendIdpRedirect(AuthenticationFlowContext context, RealmModel realm, String idpAlias) {
         String sessionCode = context.generateAccessCode();
         String brokerUrl = context.getUriInfo().getBaseUriBuilder()
             .path("realms")
