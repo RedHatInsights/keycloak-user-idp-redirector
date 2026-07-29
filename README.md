@@ -43,21 +43,27 @@ podman run -d \
 1. Login to Keycloak Admin Console
 2. Navigate to: **Authentication** → **Flows**
 3. Copy "Browser" flow → name it "Browser with IDP Redirect"
-4. Find "Username Password Form" execution
-5. Click **Actions** → **Add step**
+4. Split the login form: use a separate "Username Form" execution (not the combined "Username Password Form")
+5. Click **Actions** → **Add step** after "Username Form"
 6. Select **User IDP Redirector**
 7. Set requirement to **REQUIRED**
-8. Move it **AFTER** "Username Password Form"
-9. Navigate to: **Realm Settings** → **General** → **Endpoints**
-10. Set **Browser Flow** to "Browser with IDP Redirect"
+8. Add "Home IDP Discovery" **AFTER** "User IDP Redirector" (if used)
+9. Add "Password Form" as the final **REQUIRED** step
+10. Navigate to: **Realm Settings** → **General** → **Endpoints**
+11. Set **Browser Flow** to "Browser with IDP Redirect"
 
 ## Flow Order
 
 Correct execution order:
 1. Cookie (ALTERNATIVE)
-2. Username Password Form (ALTERNATIVE)
-3. **User IDP Redirector (REQUIRED)** ← insert here
-4. OTP Form (etc.)
+2. Browser Forms (ALTERNATIVE)
+   1. Username Form (REQUIRED)
+   2. **User IDP Redirector (REQUIRED)** ← runs first, checks federation links
+   3. Home IDP Discovery (REQUIRED) ← fallback for domain patterns
+   4. Password Form (REQUIRED) ← final fallback
+3. OTP (CONDITIONAL)
+
+**Why this order matters:** User IDP Redirector must run *before* Home IDP Discovery. A user's federated identity link takes priority over a domain-pattern match — otherwise a user could get routed to the wrong IDP based on their email domain instead of their actual linked account. See AGENTS.md for details.
 
 ## How It Works
 
