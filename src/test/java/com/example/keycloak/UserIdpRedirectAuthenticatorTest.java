@@ -1,9 +1,12 @@
 package com.example.keycloak;
 
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.keycloak.authentication.AuthenticationFlowContext;
+import org.keycloak.authentication.AuthenticationFlowError;
+import org.keycloak.events.EventBuilder;
 import org.keycloak.forms.login.LoginFormsProvider;
 import org.keycloak.http.HttpRequest;
 import org.keycloak.models.*;
@@ -24,7 +27,6 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
-import static org.mockito.Mockito.lenient;
 
 @ExtendWith(MockitoExtension.class)
 class UserIdpRedirectAuthenticatorTest {
@@ -40,6 +42,7 @@ class UserIdpRedirectAuthenticatorTest {
     @Mock private UriInfo uriInfo;
     @Mock private LoginFormsProvider loginForms;
     @Mock private HttpRequest httpRequest;
+    @Mock private EventBuilder eventBuilder;
 
     private UserIdpRedirectAuthenticator authenticator;
 
@@ -52,11 +55,11 @@ class UserIdpRedirectAuthenticatorTest {
         lenient().when(context.getSession()).thenReturn(session);
         lenient().when(context.getRealm()).thenReturn(realm);
         lenient().when(session.users()).thenReturn(userProvider);
+        lenient().when(context.getAuthenticationSession()).thenReturn(authSession);
     }
 
-    private void setupFullMocks() {
+    private void setupRedirectMocks() {
         setupBasicMocks();
-        lenient().when(context.getAuthenticationSession()).thenReturn(authSession);
         lenient().when(authSession.getClient()).thenReturn(client);
         lenient().when(authSession.getParentSession()).thenReturn(rootAuthSession);
         lenient().when(authSession.getTabId()).thenReturn("test-tab-id");
@@ -64,13 +67,12 @@ class UserIdpRedirectAuthenticatorTest {
         lenient().when(rootAuthSession.getId()).thenReturn("test-session-id");
         lenient().when(realm.getName()).thenReturn("test-realm");
         lenient().when(context.getUriInfo()).thenReturn(uriInfo);
-        lenient().when(uriInfo.getBaseUri()).thenReturn(URI.create("http://localhost:8080/"));
-        lenient().when(context.getActionUrl(any())).thenReturn(URI.create("http://localhost:8080/action"));
         lenient().when(context.generateAccessCode()).thenReturn("test-code");
 
         UriBuilder uriBuilder = mock(UriBuilder.class, RETURNS_SELF);
         lenient().when(uriInfo.getBaseUriBuilder()).thenReturn(uriBuilder);
-        lenient().when(uriBuilder.build()).thenReturn(URI.create("http://localhost:8080/realms/test-realm/broker/github/login?client_id=test-client&tab_id=test-tab-id"));
+        lenient().when(uriBuilder.build()).thenReturn(
+            URI.create("http://localhost:8080/realms/test-realm/broker/github/login?client_id=test-client&tab_id=test-tab-id"));
     }
 
     private void setupFormMocks() {
@@ -78,6 +80,12 @@ class UserIdpRedirectAuthenticatorTest {
         lenient().when(loginForms.setAttribute(anyString(), any())).thenReturn(loginForms);
         lenient().when(loginForms.setError(anyString())).thenReturn(loginForms);
         lenient().when(loginForms.createForm(anyString())).thenReturn(Response.ok().build());
+        lenient().when(loginForms.createLoginUsername()).thenReturn(Response.ok().build());
+    }
+
+    private void setupEventMocks() {
+        lenient().when(context.getEvent()).thenReturn(eventBuilder);
+        lenient().when(eventBuilder.detail(anyString(), anyString())).thenReturn(eventBuilder);
     }
 
     private IdentityProviderModel mockIdp(String alias, String displayName, boolean enabled) {
@@ -90,184 +98,304 @@ class UserIdpRedirectAuthenticatorTest {
 
     // ---- authenticate() tests ----
 
-    @Test
-    void testAuthenticateWithNoUser() {
-        when(context.getUser()).thenReturn(null);
+    @Nested
+    class Authenticate {
 
-        authenticator.authenticate(context);
+        @Test
+        void noUsernameHint_showsUsernameForm() {
+            setupBasicMocks();
+            setupFormMocks();
+            when(authSession.getAuthNote(anyString())).thenReturn(null);
+            when(authSession.getClientNote("login_hint")).thenReturn(null);
 
-        verify(context).attempted();
-        verify(context, never()).forceChallenge(any());
-        verify(context, never()).challenge(any());
-    }
+            authenticator.authenticate(context);
 
-    @Test
-    void testAuthenticateWithNoFederatedIdentities() {
-        setupBasicMocks();
-        when(context.getUser()).thenReturn(user);
-        when(userProvider.getFederatedIdentitiesStream(realm, user)).thenReturn(Stream.empty());
+            verify(loginForms).createLoginUsername();
+            verify(context).challenge(any(Response.class));
+            verify(context, never()).attempted();
+            verify(context, never()).forceChallenge(any());
+        }
 
-        authenticator.authenticate(context);
+        @Test
+        void attemptedUsername_withFederation_redirectsToIdp() {
+            setupRedirectMocks();
+            when(authSession.getAuthNote(UserIdpRedirectAuthenticator.ATTEMPTED_USERNAME)).thenReturn("bob");
+            when(userProvider.getUserByUsername(realm, "bob")).thenReturn(user);
+            when(user.getUsername()).thenReturn("bob");
 
-        verify(context).attempted();
-        verify(context, never()).forceChallenge(any());
-        verify(context, never()).challenge(any());
-    }
+            FederatedIdentityModel identity = mock(FederatedIdentityModel.class);
+            when(identity.getIdentityProvider()).thenReturn("github");
+            IdentityProviderModel idp = mockIdp("github", "GitHub", true);
+            when(realm.getIdentityProviderByAlias("github")).thenReturn(idp);
+            when(userProvider.getFederatedIdentitiesStream(realm, user)).thenReturn(Stream.of(identity));
 
-    @Test
-    void testAuthenticateWithSingleFederatedIdentity() {
-        setupFullMocks();
-        when(context.getUser()).thenReturn(user);
+            authenticator.authenticate(context);
 
-        FederatedIdentityModel identity = mock(FederatedIdentityModel.class);
-        when(identity.getIdentityProvider()).thenReturn("github");
-        IdentityProviderModel idpModel = mockIdp("github", "GitHub", true);
-        when(realm.getIdentityProviderByAlias("github")).thenReturn(idpModel);
-        when(userProvider.getFederatedIdentitiesStream(realm, user)).thenReturn(Stream.of(identity));
+            verify(context).forceChallenge(any(Response.class));
+            verify(context, never()).attempted();
+            verify(context, never()).challenge(any());
+        }
 
-        authenticator.authenticate(context);
+        @Test
+        void attemptedUsername_noFederation_attempted() {
+            setupBasicMocks();
+            when(authSession.getAuthNote(UserIdpRedirectAuthenticator.ATTEMPTED_USERNAME)).thenReturn("bob");
+            when(userProvider.getUserByUsername(realm, "bob")).thenReturn(user);
+            when(userProvider.getFederatedIdentitiesStream(realm, user)).thenReturn(Stream.empty());
 
-        verify(context).forceChallenge(any(Response.class));
-        verify(context, never()).attempted();
-        verify(context, never()).challenge(any());
-    }
+            authenticator.authenticate(context);
 
-    @Test
-    void testAuthenticateWithMultipleFederatedIdentitiesShowsSelectionForm() {
-        setupFullMocks();
-        setupFormMocks();
-        when(context.getUser()).thenReturn(user);
+            verify(context).attempted();
+            verify(authSession).setAuthNote(UserIdpRedirectAuthenticator.ATTEMPTED_USERNAME, "bob");
+            verify(context, never()).forceChallenge(any());
+        }
 
-        FederatedIdentityModel identity1 = mock(FederatedIdentityModel.class);
-        when(identity1.getIdentityProvider()).thenReturn("github");
-        FederatedIdentityModel identity2 = mock(FederatedIdentityModel.class);
-        when(identity2.getIdentityProvider()).thenReturn("google");
+        @Test
+        void attemptedUsername_unknownUser_attempted() {
+            setupBasicMocks();
+            when(authSession.getAuthNote(UserIdpRedirectAuthenticator.ATTEMPTED_USERNAME)).thenReturn("ghost");
+            when(userProvider.getUserByUsername(realm, "ghost")).thenReturn(null);
 
-        IdentityProviderModel githubIdp = mockIdp("github", "GitHub", true);
-        IdentityProviderModel googleIdp = mockIdp("google", "Google", true);
-        when(realm.getIdentityProviderByAlias("github")).thenReturn(githubIdp);
-        when(realm.getIdentityProviderByAlias("google")).thenReturn(googleIdp);
+            authenticator.authenticate(context);
 
-        when(userProvider.getFederatedIdentitiesStream(realm, user))
-            .thenReturn(Stream.of(identity1, identity2));
+            verify(context).attempted();
+            verify(authSession).setAuthNote(UserIdpRedirectAuthenticator.ATTEMPTED_USERNAME, "ghost");
+        }
 
-        authenticator.authenticate(context);
+        @Test
+        void loginHint_withFederation_redirectsToIdp() {
+            setupRedirectMocks();
+            when(authSession.getAuthNote(UserIdpRedirectAuthenticator.ATTEMPTED_USERNAME)).thenReturn(null);
+            when(authSession.getClientNote("login_hint")).thenReturn("bob");
+            when(userProvider.getUserByUsername(realm, "bob")).thenReturn(user);
+            when(user.getUsername()).thenReturn("bob");
 
-        verify(context).challenge(any(Response.class));
-        verify(context, never()).forceChallenge(any());
-        verify(context, never()).attempted();
-        verify(authSession).setAuthNote(eq("idp_redirector_aliases"), anyString());
-        verify(loginForms).setAttribute(eq("idps"), any());
-        verify(loginForms).createForm("select-idp.ftl");
-    }
+            FederatedIdentityModel identity = mock(FederatedIdentityModel.class);
+            when(identity.getIdentityProvider()).thenReturn("github");
+            IdentityProviderModel idp = mockIdp("github", "GitHub", true);
+            when(realm.getIdentityProviderByAlias("github")).thenReturn(idp);
+            when(userProvider.getFederatedIdentitiesStream(realm, user)).thenReturn(Stream.of(identity));
 
-    @Test
-    void testAuthenticateWithDisabledIdp() {
-        setupBasicMocks();
-        when(context.getUser()).thenReturn(user);
+            authenticator.authenticate(context);
 
-        FederatedIdentityModel identity = mock(FederatedIdentityModel.class);
-        when(identity.getIdentityProvider()).thenReturn("github");
-        IdentityProviderModel idpModel = mockIdp("github", "GitHub", false);
-        when(realm.getIdentityProviderByAlias("github")).thenReturn(idpModel);
-        when(userProvider.getFederatedIdentitiesStream(realm, user)).thenReturn(Stream.of(identity));
+            verify(context).forceChallenge(any(Response.class));
+            verify(context, never()).attempted();
+        }
 
-        authenticator.authenticate(context);
+        @Test
+        void loginHint_noFederation_attempted() {
+            setupBasicMocks();
+            when(authSession.getAuthNote(UserIdpRedirectAuthenticator.ATTEMPTED_USERNAME)).thenReturn(null);
+            when(authSession.getClientNote("login_hint")).thenReturn("bob");
+            when(userProvider.getUserByUsername(realm, "bob")).thenReturn(user);
+            when(userProvider.getFederatedIdentitiesStream(realm, user)).thenReturn(Stream.empty());
 
-        verify(context).attempted();
-        verify(context, never()).forceChallenge(any());
-    }
+            authenticator.authenticate(context);
 
-    @Test
-    void testAuthenticateWithNonexistentIdp() {
-        setupBasicMocks();
-        when(context.getUser()).thenReturn(user);
+            verify(context).attempted();
+        }
 
-        FederatedIdentityModel identity = mock(FederatedIdentityModel.class);
-        when(identity.getIdentityProvider()).thenReturn("deleted-idp");
-        when(realm.getIdentityProviderByAlias("deleted-idp")).thenReturn(null);
-        when(userProvider.getFederatedIdentitiesStream(realm, user)).thenReturn(Stream.of(identity));
+        @Test
+        void bypass_multipleIdps_showsSelectionForm() {
+            setupBasicMocks();
+            setupFormMocks();
+            when(authSession.getAuthNote(UserIdpRedirectAuthenticator.ATTEMPTED_USERNAME)).thenReturn("bob");
+            when(userProvider.getUserByUsername(realm, "bob")).thenReturn(user);
+            when(user.getUsername()).thenReturn("bob");
 
-        authenticator.authenticate(context);
+            FederatedIdentityModel id1 = mock(FederatedIdentityModel.class);
+            when(id1.getIdentityProvider()).thenReturn("github");
+            FederatedIdentityModel id2 = mock(FederatedIdentityModel.class);
+            when(id2.getIdentityProvider()).thenReturn("google");
 
-        verify(context).attempted();
-        verify(context, never()).forceChallenge(any());
+            IdentityProviderModel githubIdp = mockIdp("github", "GitHub", true);
+            IdentityProviderModel googleIdp = mockIdp("google", "Google", true);
+            when(realm.getIdentityProviderByAlias("github")).thenReturn(githubIdp);
+            when(realm.getIdentityProviderByAlias("google")).thenReturn(googleIdp);
+            when(userProvider.getFederatedIdentitiesStream(realm, user)).thenReturn(Stream.of(id1, id2));
+
+            authenticator.authenticate(context);
+
+            verify(context).challenge(any(Response.class));
+            verify(loginForms).setAttribute(eq("idps"), any());
+            verify(loginForms).createForm("select-idp.ftl");
+            verify(authSession).setAuthNote(eq("idp_redirector_aliases"), anyString());
+        }
     }
 
     // ---- action() tests ----
 
-    @Test
-    void testActionWithValidAlias() {
-        setupFullMocks();
-        when(context.getUser()).thenReturn(user);
+    @Nested
+    class Action {
 
-        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
-        params.putSingle("idpAlias", "github");
-        when(context.getHttpRequest()).thenReturn(httpRequest);
-        when(httpRequest.getDecodedFormParameters()).thenReturn(params);
-        when(context.getAuthenticationSession()).thenReturn(authSession);
-        when(authSession.getAuthNote("idp_redirector_aliases")).thenReturn("github,google");
+        @Test
+        void usernameSubmit_withFederation_redirectsToIdp() {
+            setupRedirectMocks();
+            setupEventMocks();
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("username", "bob");
+            when(context.getHttpRequest()).thenReturn(httpRequest);
+            when(httpRequest.getDecodedFormParameters()).thenReturn(params);
+            when(userProvider.getUserByUsername(realm, "bob")).thenReturn(user);
+            when(user.getUsername()).thenReturn("bob");
 
-        IdentityProviderModel idpModel = mockIdp("github", "GitHub", true);
-        when(realm.getIdentityProviderByAlias("github")).thenReturn(idpModel);
+            FederatedIdentityModel identity = mock(FederatedIdentityModel.class);
+            when(identity.getIdentityProvider()).thenReturn("github");
+            IdentityProviderModel idp = mockIdp("github", "GitHub", true);
+            when(realm.getIdentityProviderByAlias("github")).thenReturn(idp);
+            when(userProvider.getFederatedIdentitiesStream(realm, user)).thenReturn(Stream.of(identity));
 
-        authenticator.action(context);
+            authenticator.action(context);
 
-        verify(context).forceChallenge(any(Response.class));
-        verify(context, never()).attempted();
-    }
+            verify(authSession).setAuthNote(UserIdpRedirectAuthenticator.ATTEMPTED_USERNAME, "bob");
+            verify(context).setUser(user);
+            verify(context).forceChallenge(any(Response.class));
+        }
 
-    @Test
-    void testActionWithAliasNotInAllowlist() {
-        setupFormMocks();
+        @Test
+        void usernameSubmit_noFederation_attempted() {
+            setupBasicMocks();
+            setupEventMocks();
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("username", "bob");
+            when(context.getHttpRequest()).thenReturn(httpRequest);
+            when(httpRequest.getDecodedFormParameters()).thenReturn(params);
+            when(userProvider.getUserByUsername(realm, "bob")).thenReturn(user);
+            when(userProvider.getFederatedIdentitiesStream(realm, user)).thenReturn(Stream.empty());
 
-        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
-        params.putSingle("idpAlias", "evil-idp");
-        when(context.getHttpRequest()).thenReturn(httpRequest);
-        when(httpRequest.getDecodedFormParameters()).thenReturn(params);
-        when(context.getAuthenticationSession()).thenReturn(authSession);
-        when(authSession.getAuthNote("idp_redirector_aliases")).thenReturn("github,google");
+            authenticator.action(context);
 
-        authenticator.action(context);
+            verify(authSession).setAuthNote(UserIdpRedirectAuthenticator.ATTEMPTED_USERNAME, "bob");
+            verify(context).attempted();
+        }
 
-        verify(context).challenge(any(Response.class));
-        verify(loginForms).setError("invalidIdpSelection");
-        verify(context, never()).forceChallenge(any());
-        verify(context, never()).attempted();
-    }
+        @Test
+        void usernameSubmit_unknownUser_attempted() {
+            setupBasicMocks();
+            setupEventMocks();
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("username", "ghost");
+            when(context.getHttpRequest()).thenReturn(httpRequest);
+            when(httpRequest.getDecodedFormParameters()).thenReturn(params);
+            when(userProvider.getUserByUsername(realm, "ghost")).thenReturn(null);
 
-    @Test
-    void testActionWithMissingAliasParam() {
-        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
-        when(context.getHttpRequest()).thenReturn(httpRequest);
-        when(httpRequest.getDecodedFormParameters()).thenReturn(params);
+            authenticator.action(context);
 
-        authenticator.action(context);
+            verify(authSession).setAuthNote(UserIdpRedirectAuthenticator.ATTEMPTED_USERNAME, "ghost");
+            verify(context).attempted();
+            verify(context, never()).setUser(any());
+        }
 
-        verify(context).attempted();
-        verify(context, never()).forceChallenge(any());
-    }
+        @Test
+        void usernameSubmit_multipleIdps_showsSelectionForm() {
+            setupBasicMocks();
+            setupFormMocks();
+            setupEventMocks();
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("username", "bob");
+            when(context.getHttpRequest()).thenReturn(httpRequest);
+            when(httpRequest.getDecodedFormParameters()).thenReturn(params);
+            when(userProvider.getUserByUsername(realm, "bob")).thenReturn(user);
+            when(user.getUsername()).thenReturn("bob");
 
-    @Test
-    void testActionWithNoSessionNote() {
-        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
-        params.putSingle("idpAlias", "github");
-        when(context.getHttpRequest()).thenReturn(httpRequest);
-        when(httpRequest.getDecodedFormParameters()).thenReturn(params);
-        when(context.getAuthenticationSession()).thenReturn(authSession);
-        when(authSession.getAuthNote("idp_redirector_aliases")).thenReturn(null);
+            FederatedIdentityModel id1 = mock(FederatedIdentityModel.class);
+            when(id1.getIdentityProvider()).thenReturn("github");
+            FederatedIdentityModel id2 = mock(FederatedIdentityModel.class);
+            when(id2.getIdentityProvider()).thenReturn("google");
 
-        authenticator.action(context);
+            IdentityProviderModel githubIdp = mockIdp("github", "GitHub", true);
+            IdentityProviderModel googleIdp = mockIdp("google", "Google", true);
+            when(realm.getIdentityProviderByAlias("github")).thenReturn(githubIdp);
+            when(realm.getIdentityProviderByAlias("google")).thenReturn(googleIdp);
+            when(userProvider.getFederatedIdentitiesStream(realm, user)).thenReturn(Stream.of(id1, id2));
 
-        verify(context).attempted();
-        verify(context, never()).forceChallenge(any());
+            authenticator.action(context);
+
+            verify(context).challenge(any(Response.class));
+            verify(loginForms).setAttribute(eq("idps"), any());
+            verify(loginForms).createForm("select-idp.ftl");
+        }
+
+        @Test
+        void emptyUsername_failureChallenge() {
+            setupFormMocks();
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            when(context.getHttpRequest()).thenReturn(httpRequest);
+            when(httpRequest.getDecodedFormParameters()).thenReturn(params);
+
+            authenticator.action(context);
+
+            verify(context).failureChallenge(eq(AuthenticationFlowError.INVALID_USER), any(Response.class));
+            verify(loginForms).setError("usernameRequired");
+            verify(loginForms).createLoginUsername();
+        }
+
+        @Test
+        void idpSelection_validAlias_redirects() {
+            setupRedirectMocks();
+            when(context.getUser()).thenReturn(user);
+            when(user.getUsername()).thenReturn("bob");
+
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("idpAlias", "github");
+            when(context.getHttpRequest()).thenReturn(httpRequest);
+            when(httpRequest.getDecodedFormParameters()).thenReturn(params);
+            when(authSession.getAuthNote("idp_redirector_aliases")).thenReturn("github,google");
+
+            IdentityProviderModel idpModel = mockIdp("github", "GitHub", true);
+            when(realm.getIdentityProviderByAlias("github")).thenReturn(idpModel);
+
+            authenticator.action(context);
+
+            verify(context).forceChallenge(any(Response.class));
+            verify(context, never()).attempted();
+        }
+
+        @Test
+        void idpSelection_invalidAlias_errorFormWithIdps() {
+            setupBasicMocks();
+            setupFormMocks();
+
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("idpAlias", "evil-idp");
+            when(context.getHttpRequest()).thenReturn(httpRequest);
+            when(httpRequest.getDecodedFormParameters()).thenReturn(params);
+            when(authSession.getAuthNote("idp_redirector_aliases")).thenReturn("github,google");
+
+            IdentityProviderModel githubIdp = mockIdp("github", "GitHub", true);
+            IdentityProviderModel googleIdp = mockIdp("google", "Google", true);
+            when(realm.getIdentityProviderByAlias("github")).thenReturn(githubIdp);
+            when(realm.getIdentityProviderByAlias("google")).thenReturn(googleIdp);
+
+            authenticator.action(context);
+
+            verify(context).challenge(any(Response.class));
+            verify(loginForms).setAttribute(eq("idps"), any());
+            verify(loginForms).setError("invalidIdpSelection");
+            verify(context, never()).forceChallenge(any());
+            verify(context, never()).attempted();
+        }
+
+        @Test
+        void idpSelection_noSessionNote_attempted() {
+            setupBasicMocks();
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("idpAlias", "github");
+            when(context.getHttpRequest()).thenReturn(httpRequest);
+            when(httpRequest.getDecodedFormParameters()).thenReturn(params);
+            when(authSession.getAuthNote("idp_redirector_aliases")).thenReturn(null);
+
+            authenticator.action(context);
+
+            verify(context).attempted();
+        }
     }
 
     // ---- lifecycle tests ----
 
     @Test
     void testRequiresUser() {
-        assert authenticator.requiresUser();
+        assert !authenticator.requiresUser();
     }
 
     @Test
