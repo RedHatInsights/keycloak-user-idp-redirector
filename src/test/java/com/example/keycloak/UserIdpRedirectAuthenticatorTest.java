@@ -21,6 +21,7 @@ import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.UriBuilder;
 import jakarta.ws.rs.core.UriInfo;
 import java.net.URI;
+import java.util.Map;
 import java.util.stream.Stream;
 
 import static org.mockito.ArgumentMatchers.any;
@@ -137,7 +138,7 @@ class UserIdpRedirectAuthenticatorTest {
         }
 
         @Test
-        void attemptedUsername_noFederation_attempted() {
+        void attemptedUsername_noFederation_noDomainMatch_attempted() {
             setupBasicMocks();
             when(authSession.getAuthNote(UserIdpRedirectAuthenticator.ATTEMPTED_USERNAME)).thenReturn("bob");
             when(userProvider.getUserByUsername(realm, "bob")).thenReturn(user);
@@ -151,7 +152,7 @@ class UserIdpRedirectAuthenticatorTest {
         }
 
         @Test
-        void attemptedUsername_unknownUser_attempted() {
+        void attemptedUsername_unknownUser_noDomainMatch_attempted() {
             setupBasicMocks();
             when(authSession.getAuthNote(UserIdpRedirectAuthenticator.ATTEMPTED_USERNAME)).thenReturn("ghost");
             when(userProvider.getUserByUsername(realm, "ghost")).thenReturn(null);
@@ -183,7 +184,7 @@ class UserIdpRedirectAuthenticatorTest {
         }
 
         @Test
-        void loginHint_noFederation_attempted() {
+        void loginHint_noFederation_noDomainMatch_attempted() {
             setupBasicMocks();
             when(authSession.getAuthNote(UserIdpRedirectAuthenticator.ATTEMPTED_USERNAME)).thenReturn(null);
             when(authSession.getClientNote("login_hint")).thenReturn("bob");
@@ -253,7 +254,7 @@ class UserIdpRedirectAuthenticatorTest {
         }
 
         @Test
-        void usernameSubmit_noFederation_attempted() {
+        void usernameSubmit_noFederation_noDomainMatch_attempted() {
             setupBasicMocks();
             setupEventMocks();
             MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
@@ -270,7 +271,7 @@ class UserIdpRedirectAuthenticatorTest {
         }
 
         @Test
-        void usernameSubmit_unknownUser_attempted() {
+        void usernameSubmit_unknownUser_noDomainMatch_attempted() {
             setupBasicMocks();
             setupEventMocks();
             MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
@@ -388,6 +389,292 @@ class UserIdpRedirectAuthenticatorTest {
             authenticator.action(context);
 
             verify(context).attempted();
+        }
+    }
+
+    // ---- domain fallback tests ----
+
+    @Nested
+    class DomainFallback {
+
+        private IdentityProviderModel mockIdpWithDomains(String alias, String domains, boolean matchSubdomains) {
+            IdentityProviderModel idp = mockIdp(alias, alias, true);
+            Map<String, String> config = new java.util.HashMap<>();
+            config.put("home.idp.discovery.domains", domains);
+            if (matchSubdomains) {
+                config.put("home.idp.discovery.matchSubdomains", "true");
+            }
+            when(idp.getConfig()).thenReturn(config);
+            return idp;
+        }
+
+        @Test
+        void action_noFederation_domainMatch_redirects() {
+            setupRedirectMocks();
+            setupEventMocks();
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("username", "bob@example.com");
+            when(context.getHttpRequest()).thenReturn(httpRequest);
+            when(httpRequest.getDecodedFormParameters()).thenReturn(params);
+            when(userProvider.getUserByUsername(realm, "bob@example.com")).thenReturn(user);
+            when(user.getUsername()).thenReturn("bob@example.com");
+            when(userProvider.getFederatedIdentitiesStream(realm, user)).thenReturn(Stream.empty());
+            when(user.getFirstAttribute("email")).thenReturn("bob@example.com");
+
+            IdentityProviderModel domainIdp = mockIdpWithDomains("corp-saml", "example.com", false);
+            when(realm.getIdentityProvidersStream()).thenReturn(Stream.of(domainIdp));
+
+            authenticator.action(context);
+
+            verify(context).forceChallenge(any(Response.class));
+            verify(context, never()).attempted();
+        }
+
+        @Test
+        void action_noFederation_noDomainMatch_attempted() {
+            setupBasicMocks();
+            setupEventMocks();
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("username", "bob@other.com");
+            when(context.getHttpRequest()).thenReturn(httpRequest);
+            when(httpRequest.getDecodedFormParameters()).thenReturn(params);
+            when(userProvider.getUserByUsername(realm, "bob@other.com")).thenReturn(user);
+            when(userProvider.getFederatedIdentitiesStream(realm, user)).thenReturn(Stream.empty());
+            when(user.getFirstAttribute("email")).thenReturn("bob@other.com");
+
+            IdentityProviderModel domainIdp = mockIdpWithDomains("corp-saml", "example.com", false);
+            when(realm.getIdentityProvidersStream()).thenReturn(Stream.of(domainIdp));
+
+            authenticator.action(context);
+
+            verify(context).attempted();
+            verify(context, never()).forceChallenge(any());
+        }
+
+        @Test
+        void action_federationTakesPriority_overDomainMatch() {
+            setupRedirectMocks();
+            setupEventMocks();
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("username", "bob@example.com");
+            when(context.getHttpRequest()).thenReturn(httpRequest);
+            when(httpRequest.getDecodedFormParameters()).thenReturn(params);
+            when(userProvider.getUserByUsername(realm, "bob@example.com")).thenReturn(user);
+            when(user.getUsername()).thenReturn("bob@example.com");
+
+            FederatedIdentityModel identity = mock(FederatedIdentityModel.class);
+            when(identity.getIdentityProvider()).thenReturn("linked-idp");
+            IdentityProviderModel linkedIdp = mockIdp("linked-idp", "Linked IDP", true);
+            when(realm.getIdentityProviderByAlias("linked-idp")).thenReturn(linkedIdp);
+            when(userProvider.getFederatedIdentitiesStream(realm, user)).thenReturn(Stream.of(identity));
+
+            authenticator.action(context);
+
+            verify(context).forceChallenge(any(Response.class));
+            verify(realm, never()).getIdentityProvidersStream();
+        }
+
+        @Test
+        void action_unknownUser_domainMatchFromUsername_redirects() {
+            setupRedirectMocks();
+            setupEventMocks();
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("username", "newuser@example.com");
+            when(context.getHttpRequest()).thenReturn(httpRequest);
+            when(httpRequest.getDecodedFormParameters()).thenReturn(params);
+            when(userProvider.getUserByUsername(realm, "newuser@example.com")).thenReturn(null);
+
+            IdentityProviderModel domainIdp = mockIdpWithDomains("corp-saml", "example.com", false);
+            when(realm.getIdentityProvidersStream()).thenReturn(Stream.of(domainIdp));
+
+            authenticator.action(context);
+
+            verify(context).forceChallenge(any(Response.class));
+            verify(context, never()).attempted();
+        }
+
+        @Test
+        void action_unknownUser_noDomainMatch_attempted() {
+            setupBasicMocks();
+            setupEventMocks();
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("username", "newuser@unknown.com");
+            when(context.getHttpRequest()).thenReturn(httpRequest);
+            when(httpRequest.getDecodedFormParameters()).thenReturn(params);
+            when(userProvider.getUserByUsername(realm, "newuser@unknown.com")).thenReturn(null);
+
+            IdentityProviderModel domainIdp = mockIdpWithDomains("corp-saml", "example.com", false);
+            when(realm.getIdentityProvidersStream()).thenReturn(Stream.of(domainIdp));
+
+            authenticator.action(context);
+
+            verify(context).attempted();
+            verify(context, never()).forceChallenge(any());
+        }
+
+        @Test
+        void subdomainMatch_whenEnabled_redirects() {
+            setupRedirectMocks();
+            setupEventMocks();
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("username", "bob@sub.example.com");
+            when(context.getHttpRequest()).thenReturn(httpRequest);
+            when(httpRequest.getDecodedFormParameters()).thenReturn(params);
+            when(userProvider.getUserByUsername(realm, "bob@sub.example.com")).thenReturn(user);
+            when(user.getUsername()).thenReturn("bob@sub.example.com");
+            when(userProvider.getFederatedIdentitiesStream(realm, user)).thenReturn(Stream.empty());
+            when(user.getFirstAttribute("email")).thenReturn("bob@sub.example.com");
+
+            IdentityProviderModel domainIdp = mockIdpWithDomains("corp-saml", "example.com", true);
+            when(realm.getIdentityProvidersStream()).thenReturn(Stream.of(domainIdp));
+
+            authenticator.action(context);
+
+            verify(context).forceChallenge(any(Response.class));
+            verify(context, never()).attempted();
+        }
+
+        @Test
+        void subdomainMatch_whenDisabled_attempted() {
+            setupBasicMocks();
+            setupEventMocks();
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("username", "bob@sub.example.com");
+            when(context.getHttpRequest()).thenReturn(httpRequest);
+            when(httpRequest.getDecodedFormParameters()).thenReturn(params);
+            when(userProvider.getUserByUsername(realm, "bob@sub.example.com")).thenReturn(user);
+            when(userProvider.getFederatedIdentitiesStream(realm, user)).thenReturn(Stream.empty());
+            when(user.getFirstAttribute("email")).thenReturn("bob@sub.example.com");
+
+            IdentityProviderModel domainIdp = mockIdpWithDomains("corp-saml", "example.com", false);
+            when(realm.getIdentityProvidersStream()).thenReturn(Stream.of(domainIdp));
+
+            authenticator.action(context);
+
+            verify(context).attempted();
+            verify(context, never()).forceChallenge(any());
+        }
+
+        @Test
+        void perAttributeDomainConfig_takesPrecedence() {
+            setupRedirectMocks();
+            setupEventMocks();
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("username", "bob@specific.com");
+            when(context.getHttpRequest()).thenReturn(httpRequest);
+            when(httpRequest.getDecodedFormParameters()).thenReturn(params);
+            when(userProvider.getUserByUsername(realm, "bob@specific.com")).thenReturn(user);
+            when(user.getUsername()).thenReturn("bob@specific.com");
+            when(userProvider.getFederatedIdentitiesStream(realm, user)).thenReturn(Stream.empty());
+            when(user.getFirstAttribute("email")).thenReturn("bob@specific.com");
+
+            IdentityProviderModel idp = mockIdp("corp-saml", "Corp SAML", true);
+            Map<String, String> config = new java.util.HashMap<>();
+            config.put("home.idp.discovery.domains", "general.com");
+            config.put("home.idp.discovery.domains.email", "specific.com");
+            when(idp.getConfig()).thenReturn(config);
+            when(realm.getIdentityProvidersStream()).thenReturn(Stream.of(idp));
+
+            authenticator.action(context);
+
+            verify(context).forceChallenge(any(Response.class));
+            verify(context, never()).attempted();
+        }
+
+        @Test
+        void userWithNullEmail_noDomainMatch_attempted() {
+            setupBasicMocks();
+            setupEventMocks();
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("username", "bob");
+            when(context.getHttpRequest()).thenReturn(httpRequest);
+            when(httpRequest.getDecodedFormParameters()).thenReturn(params);
+            when(userProvider.getUserByUsername(realm, "bob")).thenReturn(user);
+            when(userProvider.getFederatedIdentitiesStream(realm, user)).thenReturn(Stream.empty());
+            when(user.getFirstAttribute("email")).thenReturn(null);
+
+            authenticator.action(context);
+
+            verify(context).attempted();
+        }
+
+        @Test
+        void bypass_noFederation_domainMatch_redirects() {
+            setupRedirectMocks();
+            when(authSession.getAuthNote(UserIdpRedirectAuthenticator.ATTEMPTED_USERNAME)).thenReturn("bob@example.com");
+            when(userProvider.getUserByUsername(realm, "bob@example.com")).thenReturn(user);
+            when(user.getUsername()).thenReturn("bob@example.com");
+            when(userProvider.getFederatedIdentitiesStream(realm, user)).thenReturn(Stream.empty());
+            when(user.getFirstAttribute("email")).thenReturn("bob@example.com");
+
+            IdentityProviderModel domainIdp = mockIdpWithDomains("corp-saml", "example.com", false);
+            when(realm.getIdentityProvidersStream()).thenReturn(Stream.of(domainIdp));
+
+            authenticator.authenticate(context);
+
+            verify(context).forceChallenge(any(Response.class));
+            verify(context, never()).attempted();
+        }
+
+        @Test
+        void bypass_unknownUser_domainMatch_redirects() {
+            setupRedirectMocks();
+            when(authSession.getAuthNote(UserIdpRedirectAuthenticator.ATTEMPTED_USERNAME)).thenReturn("new@example.com");
+            when(userProvider.getUserByUsername(realm, "new@example.com")).thenReturn(null);
+
+            IdentityProviderModel domainIdp = mockIdpWithDomains("corp-saml", "example.com", false);
+            when(realm.getIdentityProvidersStream()).thenReturn(Stream.of(domainIdp));
+
+            authenticator.authenticate(context);
+
+            verify(context).forceChallenge(any(Response.class));
+            verify(context, never()).attempted();
+        }
+
+        @Test
+        void multipleDomains_separatedByDelimiter_matches() {
+            setupRedirectMocks();
+            setupEventMocks();
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("username", "bob@second.com");
+            when(context.getHttpRequest()).thenReturn(httpRequest);
+            when(httpRequest.getDecodedFormParameters()).thenReturn(params);
+            when(userProvider.getUserByUsername(realm, "bob@second.com")).thenReturn(user);
+            when(user.getUsername()).thenReturn("bob@second.com");
+            when(userProvider.getFederatedIdentitiesStream(realm, user)).thenReturn(Stream.empty());
+            when(user.getFirstAttribute("email")).thenReturn("bob@second.com");
+
+            IdentityProviderModel idp = mockIdp("corp-saml", "Corp SAML", true);
+            Map<String, String> config = new java.util.HashMap<>();
+            config.put("home.idp.discovery.domains", "first.com##second.com##third.com");
+            when(idp.getConfig()).thenReturn(config);
+            when(realm.getIdentityProvidersStream()).thenReturn(Stream.of(idp));
+
+            authenticator.action(context);
+
+            verify(context).forceChallenge(any(Response.class));
+            verify(context, never()).attempted();
+        }
+
+        @Test
+        void disabledIdp_notConsideredForDomainMatch() {
+            setupBasicMocks();
+            setupEventMocks();
+            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+            params.putSingle("username", "bob@example.com");
+            when(context.getHttpRequest()).thenReturn(httpRequest);
+            when(httpRequest.getDecodedFormParameters()).thenReturn(params);
+            when(userProvider.getUserByUsername(realm, "bob@example.com")).thenReturn(user);
+            when(userProvider.getFederatedIdentitiesStream(realm, user)).thenReturn(Stream.empty());
+            when(user.getFirstAttribute("email")).thenReturn("bob@example.com");
+
+            IdentityProviderModel disabledIdp = mockIdp("corp-saml", "Corp SAML", false);
+            when(realm.getIdentityProvidersStream()).thenReturn(Stream.of(disabledIdp));
+
+            authenticator.action(context);
+
+            verify(context).attempted();
+            verify(context, never()).forceChallenge(any());
         }
     }
 

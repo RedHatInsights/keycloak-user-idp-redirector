@@ -1,6 +1,6 @@
 # Keycloak User IDP Redirector Plugin
 
-Keycloak 26 authenticator plugin that owns the username-only login form and auto-redirects users to their linked federated IDP. Checks federation links before Home IDP Discovery does domain matching, while preserving the standard login UX.
+Keycloak 26 authenticator plugin that owns the username-only login form and auto-redirects users to their IDP. Checks federation links first, then falls back to domain-based matching (using `home.idp.discovery.domains` IDP config), replacing the need for Home IDP Discovery in the flow.
 
 ## Architecture
 
@@ -17,20 +17,29 @@ Keycloak 26 authenticator plugin that owns the username-only login form and auto
 
 ### Flow Logic
 1. `authenticate()` checks for existing username hint (`ATTEMPTED_USERNAME` or `login_hint`)
-   - **Hint found** → resolve user, check federation, redirect or `attempted()`
+   - **Hint found** → resolve user, check federation, check domain, redirect or `attempted()`
    - **No hint** → render username-only form via `challenge()`
 2. `action()` receives form submission
-   - **Username submitted** → resolve user, check federation links
-     - Federation found (single IDP) → redirect
-     - Federation found (multiple IDPs) → show selection form
-     - No federation or unknown user → `attempted()` with `ATTEMPTED_USERNAME` set
+   - **Username submitted** → resolve user, then priority chain:
+     1. Federation link found (single IDP) → redirect
+     2. Federation link found (multiple IDPs) → show selection form
+     3. No federation, domain match found → redirect (reads `home.idp.discovery.domains` from IDP config)
+     4. Unknown user, domain extracted from username → redirect
+     5. No match → `attempted()` with `ATTEMPTED_USERNAME` set
    - **IDP alias submitted** → validate against session allowlist, redirect
 
-## Integration: Home IDP Discovery
+### Domain Matching
+When no federation link exists, falls back to domain-based IDP discovery:
+- Reads the user's `email` attribute (or extracts domain from username for unknown users)
+- Extracts domain part (after `@`)
+- Matches against `home.idp.discovery.domains` config on each enabled IDP (delimited by `##`)
+- Supports per-attribute override key: `home.idp.discovery.domains.email`
+- Supports subdomain matching via `home.idp.discovery.matchSubdomains` IDP config
+- Compatible with Home IDP Discovery's IDP configuration — same config keys, same matching semantics
 
-Home IDP Discovery (`de.sventorben:keycloak-home-idp-discovery`) is a **third-party** authenticator. It reads the `ATTEMPTED_USERNAME` auth note (set by this plugin) and does domain-based matching. It never calls `context.setUser()` on no-match.
+## Integration Notes
 
-**CRITICAL:** This plugin MUST run BEFORE Home IDP Discovery. It owns the username form and sets `ATTEMPTED_USERNAME` for downstream consumers.
+This plugin replaces Home IDP Discovery (`de.sventorben:keycloak-home-idp-discovery`) in the authentication flow. It reads the same `home.idp.discovery.domains` IDP config, so no IDP reconfiguration is needed when migrating.
 
 **Priority hierarchy:** User-specific federation link > Domain pattern > Password
 
@@ -38,11 +47,12 @@ Home IDP Discovery (`de.sventorben:keycloak-home-idp-discovery`) is a **third-pa
 ```
 Browser Flow
 ├─ Cookie (ALTERNATIVE)
-├─ User IDP Redirector (ALTERNATIVE)   ← username form, federation check
-├─ Home IDP Discovery (ALTERNATIVE)    ← bypassLoginPage=true, domain match
+├─ User IDP Redirector (ALTERNATIVE)   ← username form, federation check, domain fallback
 ├─ Forms Subflow (ALTERNATIVE)
 │  └─ Username+Password Form (REQUIRED) ← full form, username pre-filled
 ```
+
+Home IDP Discovery should be **removed** from the flow to avoid double username prompts.
 
 ## Build
 ```bash
